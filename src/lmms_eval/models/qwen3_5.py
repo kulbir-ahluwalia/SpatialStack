@@ -104,6 +104,83 @@ def build_qwen3_5_geometry_inputs(images, image_grid_thw, patch_size: int = 14):
     return padded_tensors
 
 
+# === v17 Stage 1: A/B geometry-input lmms_eval support (CoRL ablations) ===
+# Exact duplicates of the builders from scripts/inference/infer.py so lmms_eval
+# can drive A/B without import coupling. Deliberate diffs:
+#   A = bicubic + pad=1.0 (baseline)
+#   B = nearest + pad=0.0 + *0.9 norm (variant for geometry encoder sensitivity test)
+# Launch A vs B in parallel on separate GPUs via:
+#   CUDA_VISIBLE_DEVICES=0 MODEL_ARGS_EXTRA="geometry_mode=A" ... eval.sh &
+#   CUDA_VISIBLE_DEVICES=1 MODEL_ARGS_EXTRA="geometry_mode=B" ... eval.sh &
+# (eval.sh already supports MODEL_ARGS_EXTRA + CUDA_VISIBLE_DEVICES for this)
+def build_qwen3_5_geometry_inputs_A(images, image_grid_thw, patch_size: int = 14):
+    """Variant A (baseline-style): bicubic resize, pad=1.0 (white), /255 norm. Matches original intent."""
+    geometry_tensors = []
+    max_height = 0
+    max_width = 0
+
+    for image, grid in zip(images, image_grid_thw):
+        _, grid_h, grid_w = [int(v) for v in grid.tolist()]
+        target_height = grid_h * patch_size
+        target_width = grid_w * patch_size
+        resized = image.resize((target_width, target_height), Image.Resampling.BICUBIC)
+        tensor = torch.from_numpy(np.array(resized, copy=True)).permute(2, 0, 1).float() / 255.0
+        geometry_tensors.append(tensor)
+        max_height = max(max_height, target_height)
+        max_width = max(max_width, target_width)
+
+    padded_tensors = []
+    for tensor in geometry_tensors:
+        h_padding = max_height - tensor.shape[1]
+        w_padding = max_width - tensor.shape[2]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            tensor = torch.nn.functional.pad(
+                tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+            )
+        padded_tensors.append(tensor)
+
+    return padded_tensors
+
+
+def build_qwen3_5_geometry_inputs_B(images, image_grid_thw, patch_size: int = 14):
+    """Variant B (diff test for PoC): nearest resize (pixel-art bias for ag structures?), pad=0.0 (black), /255 then *0.9 for contrast shift."""
+    geometry_tensors = []
+    max_height = 0
+    max_width = 0
+
+    for image, grid in zip(images, image_grid_thw):
+        _, grid_h, grid_w = [int(v) for v in grid.tolist()]
+        target_height = grid_h * patch_size
+        target_width = grid_w * patch_size
+        resized = image.resize((target_width, target_height), Image.Resampling.NEAREST)  # deliberate diff from A
+        tensor = torch.from_numpy(np.array(resized, copy=True)).permute(2, 0, 1).float() / 255.0
+        tensor = tensor * 0.9  # deliberate norm shift for A/B contrast in PoC
+        geometry_tensors.append(tensor)
+        max_height = max(max_height, target_height)
+        max_width = max(max_width, target_width)
+
+    padded_tensors = []
+    for tensor in geometry_tensors:
+        h_padding = max_height - tensor.shape[1]
+        w_padding = max_width - tensor.shape[2]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            tensor = torch.nn.functional.pad(
+                tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0  # deliberate diff
+            )
+        padded_tensors.append(tensor)
+
+    return padded_tensors
+# === end v17 Stage 1 A/B lmms_eval builders ===
+
+
 def move_qwen3_5_eval_inputs_to_device(inputs, device):
     inputs = inputs.to(device)
     if "geometry_encoder_inputs" in inputs:
@@ -132,6 +209,7 @@ class Qwen3_5(lmms):
         strip_thinking: bool = True,
         max_length: Optional[int] = None,
         geometry_encoder_path: Optional[str] = None,
+        geometry_mode: str = "default",
         **kwargs,
     ) -> None:
         super().__init__()
@@ -149,6 +227,14 @@ class Qwen3_5(lmms):
         self.add_frame_index = add_frame_index
         self.disable_thinking = disable_thinking
         self.strip_thinking = strip_thinking
+        # v17 geometry A/B support (passed via --model_args geometry_mode=A|B|default in lmms_eval)
+        gm = str(geometry_mode).strip().lower()
+        if gm == "default":
+            self.geometry_mode = "default"
+        elif gm in ("a", "b"):
+            self.geometry_mode = gm.upper()
+        else:
+            raise ValueError(f"geometry_mode must be one of 'default', 'A', 'B' (got {geometry_mode!r})")
         self.fast_path_runtime = detect_qwen3_5_fast_path_runtime()
         if not all(self.fast_path_runtime.values()):
             missing = ", ".join(name for name, available in self.fast_path_runtime.items() if not available)
@@ -404,7 +490,14 @@ class Qwen3_5(lmms):
             if self.uses_geometry_encoder_for_eval():
                 if len(sample_images) != 1:
                     raise ValueError("Qwen3.5 geometry eval currently expects per-device batch size 1.")
-                geometry_encoder_inputs = build_qwen3_5_geometry_inputs(
+                # v17 A/B selection: driven by geometry_mode in model_args for parallel GPU ablations
+                if getattr(self, "geometry_mode", "default") == "A":
+                    geo_builder = build_qwen3_5_geometry_inputs_A
+                elif getattr(self, "geometry_mode", "default") == "B":
+                    geo_builder = build_qwen3_5_geometry_inputs_B
+                else:
+                    geo_builder = build_qwen3_5_geometry_inputs
+                geometry_encoder_inputs = geo_builder(
                     sample_images[0],
                     inputs["image_grid_thw"],
                 )

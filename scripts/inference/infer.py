@@ -56,6 +56,12 @@ def parse_args():
         action="store_true",
         help="Disable Qwen3.5 thinking mode when supported by the chat template.",
     )
+    parser.add_argument(
+        "--geometry-mode",
+        choices=["default", "A", "B"],
+        default="default",
+        help="v17 Stage 1 A/B geometry-input ablation PoC: 'A' (baseline pad=1.0 bicubic), 'B' (variant pad=0.0 + nearest for diff test), or 'default' (auto from model config). Use for quick inference comparisons on ag scenes.",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=None)
@@ -178,6 +184,78 @@ def build_qwen3_5_geometry_inputs(images, image_grid_thw, patch_size: int = 14):
         padded_tensors.append(tensor)
 
     return padded_tensors
+
+
+# === v17 Stage 1: A/B geometry-input inference PoC (added for CoRL/RAL ablations) ===
+# Two distinct prep variants for rapid A/B comparison of geometry encoder inputs.
+# Both take same (images, image_grid_thw) as original; differ in resize interp + pad value + norm.
+# Run with --geometry-mode A vs B on identical prompt/visuals to surface differences in waypoint outputs.
+def build_qwen3_5_geometry_inputs_A(images, image_grid_thw, patch_size: int = 14):
+    """Variant A (baseline-style): bicubic resize, pad=1.0 (white), /255 norm. Matches original intent."""
+    geometry_tensors = []
+    max_height = 0
+    max_width = 0
+
+    for image, grid in zip(images, image_grid_thw):
+        _, grid_h, grid_w = [int(v) for v in grid.tolist()]
+        target_height = grid_h * patch_size
+        target_width = grid_w * patch_size
+        resized = image.resize((target_width, target_height), Image.Resampling.BICUBIC)
+        tensor = torch.from_numpy(np.array(resized, copy=True)).permute(2, 0, 1).float() / 255.0
+        geometry_tensors.append(tensor)
+        max_height = max(max_height, target_height)
+        max_width = max(max_width, target_width)
+
+    padded_tensors = []
+    for tensor in geometry_tensors:
+        h_padding = max_height - tensor.shape[1]
+        w_padding = max_width - tensor.shape[2]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            tensor = torch.nn.functional.pad(
+                tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=1.0
+            )
+        padded_tensors.append(tensor)
+
+    return padded_tensors
+
+
+def build_qwen3_5_geometry_inputs_B(images, image_grid_thw, patch_size: int = 14):
+    """Variant B (diff test for PoC): nearest resize (pixel-art bias for ag structures?), pad=0.0 (black), /255 then *0.9 for contrast shift."""
+    geometry_tensors = []
+    max_height = 0
+    max_width = 0
+
+    for image, grid in zip(images, image_grid_thw):
+        _, grid_h, grid_w = [int(v) for v in grid.tolist()]
+        target_height = grid_h * patch_size
+        target_width = grid_w * patch_size
+        resized = image.resize((target_width, target_height), Image.Resampling.NEAREST)  # deliberate diff from A
+        tensor = torch.from_numpy(np.array(resized, copy=True)).permute(2, 0, 1).float() / 255.0
+        tensor = tensor * 0.9  # deliberate norm shift for A/B contrast in PoC
+        geometry_tensors.append(tensor)
+        max_height = max(max_height, target_height)
+        max_width = max(max_width, target_width)
+
+    padded_tensors = []
+    for tensor in geometry_tensors:
+        h_padding = max_height - tensor.shape[1]
+        w_padding = max_width - tensor.shape[2]
+        if h_padding > 0 or w_padding > 0:
+            pad_top = h_padding // 2
+            pad_bottom = h_padding - pad_top
+            pad_left = w_padding // 2
+            pad_right = w_padding - pad_left
+            tensor = torch.nn.functional.pad(
+                tensor, (pad_left, pad_right, pad_top, pad_bottom), mode="constant", value=0.0  # deliberate diff
+            )
+        padded_tensors.append(tensor)
+
+    return padded_tensors
+# === end v17 Stage 1 A/B PoC helpers ===
 
 
 def resolve_model_class(model_family: str, use_geometry_model: bool):
@@ -339,9 +417,17 @@ def main():
             return_tensors="pt",
         )
         if use_geometry_model:
+            mode = getattr(args, "geometry_mode", "default")
+            if mode == "A":
+                geo_builder = build_qwen3_5_geometry_inputs_A
+            elif mode == "B":
+                geo_builder = build_qwen3_5_geometry_inputs_B
+            else:
+                geo_builder = build_qwen3_5_geometry_inputs  # default / legacy
             geometry_encoder_inputs = [
-                torch.stack(build_qwen3_5_geometry_inputs(raw_image_inputs, model_inputs["image_grid_thw"]))
+                torch.stack(geo_builder(raw_image_inputs, model_inputs["image_grid_thw"]))
             ]
+            # v17 Stage 1 PoC note: A vs B runs will differ in geometry tensor stats (check with --output-json + post-hoc diff)
     else:
         image_inputs, geometry_encoder_inputs = prepare_visual_inputs(messages, processor)
         model_inputs = processor(
